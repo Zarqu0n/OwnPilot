@@ -18,6 +18,7 @@ import type {
 import type { ApprovalRequest } from '../api';
 import { executionPermissionsApi, memoriesApi } from '../api';
 import { parseSSELine } from '../utils/sse-parser';
+import { generateId } from '../utils/generate-id';
 import { STORAGE_KEYS } from '../constants/storage-keys';
 
 // Progress event types from the stream
@@ -237,7 +238,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         // Add user message for new messages
         if (!isRetry) {
           const userMessage: Message = {
-            id: crypto.randomUUID(),
+            id: generateId(),
             role: 'user',
             content,
             timestamp: new Date().toISOString(),
@@ -445,7 +446,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             : undefined;
 
           const assistantMessage: Message = {
-            id: crypto.randomUUID(),
+            id: generateId(),
             role: 'assistant',
             content: (accumulatedContent || finalResponse?.response || '')
               .replace(/<(?:think|thinking)>[\s\S]*?<\/(?:think|thinking)>\s*/g, '')
@@ -485,7 +486,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           setLastFailedMessage(null);
 
           const assistantMessage: Message = {
-            id: crypto.randomUUID(),
+            id: generateId(),
             role: 'assistant',
             content: data.data.response,
             timestamp: new Date().toISOString(),
@@ -528,7 +529,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
         // Add error message
         const errorMessage: Message = {
-          id: crypto.randomUUID(),
+          id: generateId(),
           role: 'assistant',
           content: `Sorry, I encountered an error: ${errorText}`,
           timestamp: new Date().toISOString(),

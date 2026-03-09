@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { generateId } from '../utils/generate-id';
 import {
   Plus,
   Wrench,
@@ -825,7 +826,7 @@ export function ToolPicker({ onSelect, disabled }: ToolPickerProps) {
     const updated = [
       ...prompts,
       {
-        id: crypto.randomUUID(),
+        id: generateId(),
         title: newPromptTitle.trim(),
         content: newPromptContent.trim(),
         createdAt: new Date().toISOString(),
