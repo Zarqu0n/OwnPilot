@@ -102,11 +102,15 @@ export class ConversationMemory {
     content: string | readonly ContentPart[],
     metadata?: Record<string, unknown>
   ): Conversation | undefined {
-    return this.addMessage(conversationId, {
-      role: 'user',
+    const message = {
+      role: 'user' as const,
       content,
-      metadata,
-    });
+      metadata: {
+        ...metadata,
+        hasCode: typeof content === 'string' && this.containsCodeBlock(content)
+      }
+    };
+    return this.addMessage(conversationId, message);
   }
 
   /**
@@ -140,6 +144,7 @@ export class ConversationMemory {
   /**
    * Get messages for context (applies token limit).
    * Older tool results are truncated to save tokens — recent ones kept intact.
+   * Prioritizes keeping messages with code blocks when trimming.
    */
   getContextMessages(conversationId: string): readonly Message[] {
     const conversation = this.conversations.get(conversationId);
@@ -147,26 +152,77 @@ export class ConversationMemory {
 
     const messages = [...conversation.messages];
 
-    // If we have a token limit, trim from the beginning
+    // If we have a token limit, trim from the beginning while prioritizing code-containing messages
     if (this.config.maxTokens > 0) {
+      // First, calculate total tokens
+      let totalTokens = 0;
+      const messageTokens = messages.map(msg => this.estimateTokens(msg));
+      
+      // Identify messages with code blocks
+      const codeMessageIndices = new Set<number>();
+      messages.forEach((msg, idx) => {
+        if (msg.role === 'user' && msg.metadata?.hasCode) {
+          codeMessageIndices.add(idx);
+        } else if (msg.role === 'user' && typeof msg.content === 'string' && this.containsCodeBlock(msg.content)) {
+          codeMessageIndices.add(idx);
+        }
+      });
+
+      // If we're under the token limit, return all messages
+      if (messageTokens.reduce((sum, tokens) => sum + tokens, 0) <= this.config.maxTokens) {
+        return this.truncateOldToolResults(messages);
+      }
+
+      // Otherwise, start from the end and work backwards, prioritizing code messages
       let tokenCount = 0;
       let startIndex = messages.length;
 
-      // Count tokens from the end (most recent first)
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i];
-        if (!msg) continue;
-
-        const msgTokens = this.estimateTokens(msg);
-        if (tokenCount + msgTokens > this.config.maxTokens) {
-          startIndex = i + 1;
-          break;
+      // We'll use a more sophisticated algorithm that tries to keep code messages
+      // First, let's identify the minimum set of messages we need to include (like recent messages and code messages)
+      const essentialIndices = new Set<number>();
+      // Always keep the last few messages (they're most likely to be relevant)
+      const recentCount = Math.min(5, messages.length); // Keep at least last 5 messages
+      for (let i = messages.length - recentCount; i < messages.length; i++) {
+        essentialIndices.add(i);
+      }
+      
+      // Also keep all code-containing messages if possible
+      for (const idx of codeMessageIndices) {
+        if (idx < messages.length - recentCount) { // Don't double-add recent messages
+          essentialIndices.add(idx);
         }
-        tokenCount += msgTokens;
-        startIndex = i;
       }
 
-      return this.truncateOldToolResults(messages.slice(startIndex));
+      // Now, try to add other messages in reverse chronological order
+      const includedIndices = new Set<number>();
+      
+      // Add essential messages first
+      for (const idx of essentialIndices) {
+        const msgTokens = messageTokens[idx] ?? 0;
+        if (tokenCount + msgTokens <= this.config.maxTokens) {
+          includedIndices.add(idx);
+          tokenCount += msgTokens;
+        }
+      }
+
+      // Then try to add other messages in reverse chronological order
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (includedIndices.has(i)) continue; // Already included
+        
+        const msgTokens = messageTokens[i] ?? 0;
+        if (tokenCount + msgTokens <= this.config.maxTokens) {
+          includedIndices.add(i);
+          tokenCount += msgTokens;
+        }
+      }
+
+      // Sort the included indices to maintain message order
+      const sortedIndices = Array.from(includedIndices).sort((a, b) => a - b);
+      const filteredMessages = sortedIndices
+        .map(i => messages[i])
+        .filter((msg): msg is Message => msg !== undefined); // Filter out any undefined values
+
+      return this.truncateOldToolResults(filteredMessages);
     }
 
     return this.truncateOldToolResults(messages);
@@ -248,8 +304,27 @@ export class ConversationMemory {
       }
     }
 
-    // ~4 characters per token
+    // For messages containing code blocks, adjust token estimation
+    // Code typically has more semantic density than regular text
+    if (typeof message.content === 'string' && this.containsCodeBlock(message.content)) {
+      // Increase token count for code-heavy messages to preserve them longer
+      return Math.ceil(chars / 3); // More conservative: ~3 characters per token for code
+    }
+
+    // ~4 characters per token for regular text
     return Math.ceil(chars / 4);
+  }
+
+  /**
+   * Check if message content contains code blocks
+   */
+  private containsCodeBlock(content: string): boolean {
+    // Check for markdown code blocks (```lang or ``` or `code`)
+    const codeBlockPattern = /(```[\s\S]*?```|`[^`]+`)/;
+    // Check for common code patterns (keywords, brackets, etc.)
+    const codePattern = /(function|class|import|export|var|let|const|if\s*\(|for\s*\(|while\s*\(|{|}|=>|\.|::|;|\n\s+\w+\s*[:=])/;
+    
+    return codeBlockPattern.test(content) || codePattern.test(content);
   }
 
   /**
