@@ -32,6 +32,7 @@ import {
   Shield,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Telegram,
   WhatsApp,
   MessageSquare,
@@ -77,11 +78,14 @@ export function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<ChatInputHandle>(null);
   const [showProviderMenu, setShowProviderMenu] = useState(false);
+  const [showAgentMenu, setShowAgentMenu] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [configuredProviders, setConfiguredProviders] = useState<string[]>([]);
   const [providerNames, setProviderNames] = useState<Record<string, string>>({});
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [currentAgent, setCurrentAgent] = useState<AgentDetail | null>(null);
+  const [availableAgents, setAvailableAgents] = useState<AgentDetail[]>([]);
+  const [isLoadingAgents, setIsLoadingAgents] = useState(true);
   const [showContextDetail, setShowContextDetail] = useState(false);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
 
@@ -103,13 +107,17 @@ export function ChatPage() {
 
   // Close dropdowns on Escape key
   useEffect(() => {
-    if (!showProviderMenu) return;
+    if (!showProviderMenu && !showAgentMenu) return;
+    
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setShowProviderMenu(false);
+      if (e.key === 'Escape') {
+        setShowProviderMenu(false);
+        setShowAgentMenu(false);
+      }
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [showProviderMenu]);
+  }, [showProviderMenu, showAgentMenu]);
 
   // WS subscription for real-time channel message updates in channel mode
   useEffect(() => {
@@ -164,7 +172,22 @@ export function ChatPage() {
       // Provider already set, just load models list for dropdown
       fetchModelsOnly();
     }
+    // Also fetch available agents
+    fetchAgents();
   }, []);
+
+  // Fetch available agents for the agent selector
+  const fetchAgents = async () => {
+    try {
+      const agentsData = await agentsApi.list();
+      // agentsData is already an array of agents, not a paginated response
+      setAvailableAgents(agentsData);
+    } catch {
+      // API client handles error reporting
+    } finally {
+      setIsLoadingAgents(false);
+    }
+  };
 
   // Fetch only models list (for dropdown) without changing provider/model
   const fetchModelsOnly = async () => {
@@ -504,6 +527,105 @@ export function ChatPage() {
               onWorkspaceChange={setWorkspaceId}
             />
 
+            {/* Agent Selector */}
+            <div className="relative">
+              <button
+                onClick={() => setShowAgentMenu(!showAgentMenu)}
+                disabled={isLoadingAgents}
+                className="flex items-center gap-2 px-3 py-1.5 text-sm bg-bg-tertiary dark:bg-dark-bg-tertiary border border-border dark:border-dark-border rounded-lg hover:bg-bg-secondary dark:hover:bg-dark-bg-secondary transition-colors disabled:opacity-50"
+              >
+                {isLoadingAgents ? (
+                  <span className="text-text-muted dark:text-dark-text-muted animate-pulse">
+                    Loading...
+                  </span>
+                ) : (
+                  <>
+                    <span className="font-medium text-text-primary dark:text-dark-text-primary">
+                      {currentAgent ? (
+                        <span className="flex items-center gap-2">
+                          <Bot className="w-4 h-4 text-primary" />
+                          {agentDisplayName}
+                        </span>
+                      ) : (
+                        'Select Agent'
+                      )}
+                    </span>
+                  </>
+                )}
+                <svg
+                  className={`w-4 h-4 text-text-muted transition-transform ${showAgentMenu ? 'rotate-180' : ''}`}
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M19 9l-7 7-7-7"
+                  />
+                </svg>
+              </button>
+
+              {/* Agent Dropdown Menu */}
+              {showAgentMenu && (
+                <div className="absolute top-full left-0 mt-1 w-64 max-w-[90vw] bg-bg-primary dark:bg-dark-bg-primary border border-border dark:border-dark-border rounded-lg shadow-lg dark:shadow-black/50 z-50 max-h-96 overflow-y-auto">
+                  {availableAgents.length === 0 ? (
+                    <div className="p-4 text-center">
+                      <p className="text-sm text-text-muted dark:text-dark-text-muted mb-2">
+                        No agents configured
+                      </p>
+                      <a
+                        href="/agents"
+                        className="text-sm text-primary hover:underline flex items-center justify-center gap-1"
+                      >
+                        <Settings className="w-4 h-4" /> Create Agent
+                      </a>
+                    </div>
+                  ) : (
+                    <div className="py-1">
+                      {availableAgents.map((agent) => {
+                        // Extract emoji from name if present
+                        const nameMatch = agent.name.match(/^(\p{Emoji})\s*(.+)$/u);
+                        const emoji = nameMatch ? nameMatch[1] : null;
+                        const displayName = nameMatch ? nameMatch[2] : agent.name;
+
+                        return (
+                          <div
+                            key={agent.id}
+                            className={`px-3 py-2 text-sm cursor-pointer hover:bg-bg-secondary dark:hover:bg-dark-bg-secondary flex items-center justify-between ${
+                              currentAgent?.id === agent.id
+                                ? 'bg-primary/10 text-primary'
+                                : 'text-text-primary dark:text-dark-text-primary'
+                            }`}
+                            onClick={() => {
+                              setCurrentAgent(agent);
+                              setAgentId(agent.id);
+                              // Update URL to reflect selected agent
+                              setSearchParams({ agent: agent.id, provider: agent.provider, model: agent.model });
+                              setShowAgentMenu(false);
+                            }}
+                          >
+                            <div className="flex items-center gap-2 truncate">
+                              {emoji ? (
+                                <span className="text-lg">{emoji}</span>
+                              ) : (
+                                <Bot className="w-4 h-4 text-primary" />
+                              )}
+                              <span className="truncate">{displayName}</span>
+                            </div>
+                            <span className="text-xs text-text-muted dark:text-dark-text-muted ml-2 flex-shrink-0">
+                              {agent.provider}/{agent.model}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
             {/* Provider/Model Selector */}
             <div className="relative">
               <button
@@ -650,9 +772,15 @@ export function ChatPage() {
           />
         )}
 
-        {/* Click outside to close menu */}
-        {showProviderMenu && (
-          <div className="fixed inset-0 z-40" onClick={() => setShowProviderMenu(false)} />
+        {/* Click outside to close menus */}
+        {(showProviderMenu || showAgentMenu) && (
+          <div 
+            className="fixed inset-0 z-40" 
+            onClick={() => {
+              setShowProviderMenu(false);
+              setShowAgentMenu(false);
+            }} 
+          />
         )}
 
         {/* Channel mode message list */}
