@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { generateId } from '../utils/generate-id';
 import { useSearchParams } from 'react-router-dom';
 import {
   Database,
@@ -529,12 +530,12 @@ function CreateTableModal({ onClose, onSave }: CreateTableModalProps) {
   const [displayName, setDisplayName] = useState('');
   const [description, setDescription] = useState('');
   const [columns, setColumns] = useState<ColumnFormEntry[]>([
-    { id: crypto.randomUUID(), name: '', type: 'text', required: false },
+    { id: generateId(), name: '', type: 'text', required: false },
   ]);
   const [isSaving, setIsSaving] = useState(false);
 
   const handleAddColumn = () => {
-    setColumns([...columns, { id: crypto.randomUUID(), name: '', type: 'text', required: false }]);
+    setColumns([...columns, { id: generateId(), name: '', type: 'text', required: false }]);
   };
 
   const handleRemoveColumn = (index: number) => {

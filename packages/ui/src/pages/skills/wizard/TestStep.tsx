@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { generateId } from '../../../utils/generate-id';
 import { Plus, Trash2, Play, SkipForward } from '../../../components/icons';
 import { useToast } from '../../../components/ToastProvider';
 import { evalApi } from '../../../api/endpoints/eval';
@@ -30,7 +31,7 @@ interface TestStepProps {
 }
 
 function newCase(): TestCase {
-  return { id: crypto.randomUUID(), query: '', expectedKeywords: '', notes: '' };
+  return { id: generateId(), query: '', expectedKeywords: '', notes: '' };
 }
 
 export function TestStep({ pkg, onNext, onSkip, onBack }: TestStepProps) {
