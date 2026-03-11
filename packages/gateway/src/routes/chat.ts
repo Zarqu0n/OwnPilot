@@ -268,16 +268,30 @@ chatRoutes.post('/', async (c) => {
     }
   }
 
-  // Load conversation if specified
+  // Load conversation if specified.
+  // When a workspace is explicitly selected, conversation/session IDs can be stale after
+  // workspace switches or server restarts. In that case, continue without failing the request.
+  let hasConversationFallback = false;
   if (body.conversationId) {
     const loaded = agent.loadConversation(body.conversationId);
     if (!loaded) {
-      return notFoundError(c, 'Conversation', body.conversationId);
+      if (body.workspaceId) {
+        hasConversationFallback = true;
+        log.warn('Conversation not found in agent memory; continuing with workspace fallback', {
+          conversationId: body.conversationId,
+          workspaceId: body.workspaceId,
+        });
+      } else {
+        return notFoundError(c, 'Conversation', body.conversationId);
+      }
     }
   }
 
   // ── System prompt initialization ──────────────────────────────────────────
-  const conversationId = agent.getConversation().id;
+  const conversationId =
+    body.conversationId && (body.workspaceId || !hasConversationFallback)
+      ? body.conversationId
+      : agent.getConversation().id;
   const isPromptInitialized = promptInitializedConversations.has(conversationId);
   const chatUserId = getUserId(c);
 
@@ -366,7 +380,10 @@ chatRoutes.post('/', async (c) => {
     const streamBus = tryGetMessageBus();
     if (streamBus) {
       return streamSSE(c, async (stream) => {
-        const conversationId = agent.getConversation().id;
+        const conversationId =
+          body.conversationId && (body.workspaceId || !hasConversationFallback)
+            ? body.conversationId
+            : agent.getConversation().id;
         const streamAgentId = body.agentId ?? `chat-${provider}`;
         const streamUserId = getUserId(c);
 
@@ -417,7 +434,10 @@ chatRoutes.post('/', async (c) => {
 
     // ── Legacy Streaming Path (fallback) ──────────────────────────────────
     return streamSSE(c, async (stream) => {
-      const conversationId = agent.getConversation().id;
+      const conversationId =
+        body.conversationId && (body.workspaceId || !hasConversationFallback)
+          ? body.conversationId
+          : agent.getConversation().id;
       const streamAgentId = body.agentId ?? `chat-${provider}`;
       const streamUserId = getUserId(c);
 
@@ -551,7 +571,7 @@ chatRoutes.post('/', async (c) => {
         userId,
         agentId,
         requestId,
-        conversationId: body.conversationId ?? agent.getConversation().id,
+        conversationId,
       });
     } catch (busError) {
       agent.setExecutionPermissions(undefined);
@@ -652,7 +672,7 @@ chatRoutes.post('/', async (c) => {
       success: true,
       data: {
         id: busResult.response.id,
-        conversationId: conversation.id,
+        conversationId,
         message: busCleanContent,
         response: busCleanContent,
         model,

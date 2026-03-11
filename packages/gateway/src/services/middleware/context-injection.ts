@@ -18,6 +18,7 @@ import {
   getServiceRegistry,
   Services,
   type IExtensionService,
+  type IMemoryService,
   debugLog,
   getTimeContext,
 } from '@ownpilot/core';
@@ -60,7 +61,7 @@ export function clearInjectionCache(userId?: string): void {
  * Expects `ctx.get('agent')` to be set by the route handler before processing.
  */
 export function createContextInjectionMiddleware(): MessageMiddleware {
-  return async (_message, ctx, next) => {
+  return async (message, ctx, next) => {
     const agent = ctx.get<{
       getConversation(): { systemPrompt?: string };
       updateSystemPrompt(p: string): void;
@@ -129,17 +130,40 @@ export function createContextInjectionMiddleware(): MessageMiddleware {
         }
       }
 
-      // 4. Build tool suggestion and data hint sections (per-request)
+      // 4. Fetch per-message relevant memories (dynamic, NOT cached)
+      let relevantMemorySuffix = '';
+      if (message.content && message.content.length >= 3) {
+        try {
+          const memoryService = getServiceRegistry().get<IMemoryService>(Services.Memory);
+          const relevantMemories = await memoryService.searchMemories(userId, message.content, {
+            limit: 5,
+          });
+
+          // Deduplicate against importance-based memories already in orchestrator
+          const existingContent = orchestratorSuffix;
+          const novel = relevantMemories.filter((m) => !existingContent.includes(m.content));
+
+          if (novel.length > 0) {
+            const lines = novel.map((m) => `- ${m.content}`);
+            relevantMemorySuffix =
+              '\n---\n## Relevant Context (from memory)\n' + lines.join('\n');
+          }
+        } catch {
+          // Memory search failure should not block the request
+        }
+      }
+
+      // 5. Build tool suggestion and data hint sections (per-request)
       const routing = ctx.get<RequestRouting>('routing');
       const toolSuggestionSuffix = buildToolSuggestionSection(routing);
       const dataHintSuffix = buildDataHintSection(routing);
 
-      // 5. Build request focus hint
+      // 6. Build request focus hint
       const focusSuffix = routing?.intentHint
         ? `\n---\n## Request Focus\n${routing.intentHint}`
         : '';
 
-      // 6. Combine sections with Anthropic prompt-cache awareness.
+      // 7. Combine sections with Anthropic prompt-cache awareness.
       //
       // Layout goal:
       //   [STATIC / cached block]  extensions + skills + orchestrator (memories/goals)
@@ -195,9 +219,10 @@ export function createContextInjectionMiddleware(): MessageMiddleware {
                 extensionSuffix +
                 skillsSuffix +
                 orchestratorSuffix +
-                // Dynamic (uncached) block: fresh time + code/file sections + routing
+                // Dynamic (uncached) block: fresh time + code/file sections + routing + relevant memories
                 freshTimeContext +
                 afterTimeContext +
+                relevantMemorySuffix +
                 toolSuggestionSuffix +
                 dataHintSuffix +
                 focusSuffix
@@ -209,6 +234,7 @@ export function createContextInjectionMiddleware(): MessageMiddleware {
             extensionSuffix +
             skillsSuffix +
             orchestratorSuffix +
+            relevantMemorySuffix +
             toolSuggestionSuffix +
             dataHintSuffix +
             focusSuffix;
@@ -224,6 +250,7 @@ export function createContextInjectionMiddleware(): MessageMiddleware {
         { name: 'extensions', content: extensionSuffix },
         { name: 'soul_skills', content: skillsSuffix },
         { name: 'orchestrator [static]', content: orchestratorSuffix },
+        { name: 'relevant_memories [dynamic]', content: relevantMemorySuffix },
         { name: 'tool_suggestions', content: toolSuggestionSuffix },
         { name: 'data_hints', content: dataHintSuffix },
         { name: 'request_focus', content: focusSuffix },

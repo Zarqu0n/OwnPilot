@@ -45,6 +45,10 @@ export interface OrchestratorOptions {
   enableTriggers?: boolean;
   /** Whether to enforce autonomy checks */
   enableAutonomy?: boolean;
+  /** Current user message for relevant memory recall */
+  messageQuery?: string;
+  /** Maximum relevant memories to fetch per message */
+  maxRelevantMemories?: number;
 }
 
 export interface EnhancedChatResult {
@@ -95,24 +99,46 @@ export async function buildEnhancedSystemPrompt(
   let memoriesUsed = 0;
   let goalsUsed = 0;
 
-  // === Parallel fetch: memories + goals ===
-  const [memories, goals] = await Promise.all([
+  // === Parallel fetch: memories + goals + relevant memories ===
+  const maxRelevantMemories = options.maxRelevantMemories ?? 5;
+  const fetchRelevantMemories =
+    options.messageQuery && options.messageQuery.length >= 3
+      ? memoryService.searchMemories(options.userId, options.messageQuery, {
+          limit: maxRelevantMemories,
+        })
+      : Promise.resolve([]);
+
+  const [memories, goals, relevantMemories] = await Promise.all([
     memoryService.listMemories(options.userId, {
       limit: maxMemories,
       orderBy: 'importance',
     }),
     goalService.listGoals(options.userId, { status: 'active', limit: maxGoals }),
+    fetchRelevantMemories.catch(() => []),
   ]);
 
   // === MEMORIES SECTION ===
-  if (memories.length > 0) {
-    memoriesUsed = memories.length;
+  // Merge importance-based and relevant memories, deduplicating by ID
+  const seenIds = new Set<string>();
+  const allMemories = [...memories];
+  for (const m of allMemories) seenIds.add(m.id);
+  for (const m of relevantMemories) {
+    if (!seenIds.has(m.id)) {
+      allMemories.push(m);
+      seenIds.add(m.id);
+    }
+  }
+
+  if (allMemories.length > 0) {
+    memoriesUsed = allMemories.length;
     const memoryLines: string[] = [];
 
     // Group by type
-    const facts = memories.filter((m) => m.type === 'fact');
-    const preferences = memories.filter((m) => m.type === 'preference');
-    const events = memories.filter((m) => m.type === 'event');
+    const facts = allMemories.filter((m) => m.type === 'fact');
+    const preferences = allMemories.filter((m) => m.type === 'preference');
+    const events = allMemories.filter((m) => m.type === 'event');
+    const conversations = allMemories.filter((m) => m.type === 'conversation');
+    const skills = allMemories.filter((m) => m.type === 'skill');
 
     if (facts.length > 0) {
       memoryLines.push('**Known Facts:**');
@@ -127,6 +153,16 @@ export async function buildEnhancedSystemPrompt(
     if (events.length > 0) {
       memoryLines.push('**Recent Events:**');
       events.forEach((m) => memoryLines.push(`- ${m.content}`));
+    }
+
+    if (conversations.length > 0) {
+      memoryLines.push('**From Previous Conversations:**');
+      conversations.forEach((m) => memoryLines.push(`- ${m.content}`));
+    }
+
+    if (skills.length > 0) {
+      memoryLines.push('**Known Skills:**');
+      skills.forEach((m) => memoryLines.push(`- ${m.content}`));
     }
 
     if (memoryLines.length > 0) {

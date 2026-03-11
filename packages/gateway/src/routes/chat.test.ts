@@ -1286,6 +1286,23 @@ describe('Chat Routes', () => {
       expect(data.error.message).toContain('Conversation not found');
     });
 
+    it('should not return 404 when workspaceId is provided and conversation is not in memory', async () => {
+      mockAgent.loadConversation.mockReturnValue(false);
+
+      const res = await app.request('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: 'Hello from workspace',
+          conversationId: 'stale-conv-id',
+          workspaceId: 'ws-1',
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(mockAgent.loadConversation).toHaveBeenCalledWith('stale-conv-id');
+    });
+
     it('should return 400 when getOrCreateChatAgent throws', async () => {
       vi.mocked(getOrCreateChatAgent).mockRejectedValue(new Error('Provider not configured'));
 
