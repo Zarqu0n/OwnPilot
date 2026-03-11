@@ -20,7 +20,7 @@ export const uiSessionMiddleware = createMiddleware(async (c, next) => {
   const fullPath = c.req.path;
   const relativePath = fullPath.replace(/^\/api\/v1/, '');
 
-  // 1. Auth-own paths — these handle their own authentication internally.
+  // 1. Auth-exempt paths — these handle their own authentication or are public.
   //    Set sessionAuthenticated so the API auth middleware (api-key/jwt) is skipped.
   if (relativePath.startsWith('/auth/')) {
     c.set('sessionAuthenticated', true);

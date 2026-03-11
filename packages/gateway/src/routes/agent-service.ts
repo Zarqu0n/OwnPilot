@@ -39,7 +39,7 @@ import { getSoulsRepository } from '../db/repositories/souls.js';
 import { getAgentMessagesRepository } from '../db/repositories/agent-messages.js';
 import { gatewayConfigCenter } from '../services/config-center-impl.js';
 import { getLog } from '../services/log.js';
-import { BASE_SYSTEM_PROMPT } from './agent-prompt.js';
+import { BASE_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT } from './agent-prompt.js';
 import {
   registerGatewayTools,
   registerDynamicTools,
@@ -88,8 +88,29 @@ import {
   AGENT_DEFAULT_MAX_TOOL_CALLS,
   AI_META_TOOL_NAMES,
 } from '../config/defaults.js';
+import {
+  isCliChatProvider,
+  getCliBinaryFromProviderId,
+  createCliChatProvider,
+  getCliChatProviderDefinition,
+} from '../services/cli-chat-provider.js';
 
 const log = getLog('AgentService');
+
+// =============================================================================
+// CLI Provider Correlation (links MCP tool calls to chat SSE streams)
+// =============================================================================
+
+/** WeakMap to store correlationId for CLI agents (for MCP event forwarding) */
+const cliCorrelationIds = new WeakMap<Agent, string>();
+
+/**
+ * Get the MCP correlation ID for a CLI agent.
+ * Returns undefined for non-CLI agents.
+ */
+export function getCliCorrelationId(agent: Agent): string | undefined {
+  return cliCorrelationIds.get(agent);
+}
 
 // =============================================================================
 // Agent creation
@@ -396,6 +417,12 @@ export async function getOrCreateChatAgent(
   model: string,
   fallback?: { provider: string; model: string }
 ): Promise<Agent> {
+  // CLI providers are NOT cached — each request may need fresh MCP session state
+  // while still reusing the persistent ~/.ownpilot/workspace directory.
+  if (isCliChatProvider(provider)) {
+    return createChatAgentInstance(provider, model, `cli-${Date.now()}`, fallback);
+  }
+
   const sanitize = (s: string) => s.replace(/\|/g, '_');
   const fbSuffix = fallback ? `|fb_${sanitize(fallback.provider)}_${sanitize(fallback.model)}` : '';
   const cacheKey = `chat|${sanitize(provider)}|${sanitize(model)}${fbSuffix}`;
@@ -425,14 +452,30 @@ async function createChatAgentInstance(
   cacheKey: string,
   fallback?: { provider: string; model: string }
 ): Promise<Agent> {
-  const apiKey = await getProviderApiKey(provider);
-  if (!apiKey) {
-    throw new Error(`API key not configured for provider: ${provider}`);
+  // ── CLI Chat Provider path ──
+  // CLI providers (cli-claude, cli-codex, cli-gemini) use login-based auth
+  // and don't require API keys. They spawn CLI processes for completions.
+  const isCliProvider = isCliChatProvider(provider);
+  let correlationId: string | undefined;
+
+  let apiKey: string | undefined;
+  if (!isCliProvider) {
+    apiKey = await getProviderApiKey(provider);
+    if (!apiKey) {
+      throw new Error(`API key not configured for provider: ${provider}`);
+    }
   }
 
-  const providerConfig = loadProviderConfig(provider);
+  const providerConfig = isCliProvider ? null : loadProviderConfig(provider);
   const baseUrl = providerConfig?.baseUrl;
-  const providerType = NATIVE_PROVIDERS.has(provider) ? provider : 'openai';
+
+  // For CLI providers, map to the underlying core provider type
+  const cliDef = isCliProvider ? getCliChatProviderDefinition(provider) : null;
+  const providerType = isCliProvider
+    ? (cliDef?.coreProvider ?? 'openai')
+    : NATIVE_PROVIDERS.has(provider)
+      ? provider
+      : 'openai';
 
   const tools = new ToolRegistry();
   registerAllTools(tools);
@@ -483,14 +526,16 @@ async function createChatAgentInstance(
   );
   const toolDefs = [...filteredChatTools, ...chatAlwaysIncluded];
 
-  const basePrompt = BASE_SYSTEM_PROMPT;
+  // CLI providers get a compact identity-first prompt (no meta-tools, no namespaces).
+  // API providers get the full prompt with tool schemas injected.
+  const basePrompt = isCliProvider ? CLI_SYSTEM_PROMPT : BASE_SYSTEM_PROMPT;
   const { systemPrompt: enhancedPrompt } = await injectMemoryIntoPrompt(basePrompt, {
     userId: 'default',
-    tools: toolDefs,
+    tools: isCliProvider ? [] : toolDefs, // CLI tools are discovered via MCP, not injected
     includeProfile: true,
     includeInstructions: true,
     includeTimeContext: true,
-    includeToolDescriptions: true,
+    includeToolDescriptions: !isCliProvider, // CLI doesn't need tool descriptions in prompt
   });
 
   // Extension sections are now injected per-request by the context-injection middleware
@@ -502,11 +547,13 @@ async function createChatAgentInstance(
   const memoryMaxTokens = Math.floor(ctxWindow * 0.75);
 
   const config: AgentConfig = {
-    name: `Personal Assistant (${provider})`,
+    name: isCliProvider
+      ? `Personal Assistant (${cliDef?.displayName ?? provider})`
+      : `Personal Assistant (${provider})`,
     systemPrompt: enhancedPrompt,
     provider: {
       provider: providerType as AIProvider,
-      apiKey,
+      apiKey: apiKey ?? 'cli-no-key',
       baseUrl,
       headers: providerConfig?.headers,
     },
@@ -515,16 +562,64 @@ async function createChatAgentInstance(
       maxTokens: AGENT_DEFAULT_MAX_TOKENS,
       temperature: AGENT_DEFAULT_TEMPERATURE,
     },
-    maxTurns: AGENT_DEFAULT_MAX_TURNS,
-    maxToolCalls: AGENT_DEFAULT_MAX_TOOL_CALLS,
-    tools: chatMetaToolFilter,
+    // CLI providers handle tool calling internally via ToolBridge (prompt-based),
+    // so the agent loop itself doesn't need to do tool calling rounds.
+    maxTurns: isCliProvider ? 1 : AGENT_DEFAULT_MAX_TURNS,
+    maxToolCalls: isCliProvider ? 0 : AGENT_DEFAULT_MAX_TOOL_CALLS,
+    tools: isCliProvider ? [] : chatMetaToolFilter,
     requestApproval: createApprovalCallback(),
     memory: { maxTokens: memoryMaxTokens },
   };
 
-  // Build FallbackProvider if a backup model is configured
+  // Build provider instance
   let providerInstance: IProvider | undefined;
-  if (fallback) {
+
+  if (isCliProvider) {
+    // CLI provider: spawn CLI process for completions.
+    // Uses MCP mode — CLI discovers tools via MCP server automatically.
+    // No ToolBridge prompt injection needed (avoids bloating the prompt).
+    const cliBinary = getCliBinaryFromProviderId(provider);
+    if (!cliBinary) {
+      throw new Error(`Unknown CLI chat provider: ${provider}`);
+    }
+
+    const useNativeMcp = cliBinary === 'claude';
+
+    // All CLI chat providers run from the persistent ~/.ownpilot/workspace directory.
+    // We always rewrite .mcp.json with a fresh session token/correlationId so any
+    // workspace MCP discovery is authenticated. Claude uses this as its native path;
+    // Gemini/Codex still rely primarily on ToolBridge.
+    const { createTempWorkspace } = await import('../mcp/workspace.js');
+    correlationId = crypto.randomUUID();
+    const { createMcpSession } = await import('../services/ui-session.js');
+    const mcpSession = createMcpSession();
+    const workspace = await createTempWorkspace({
+      correlationId,
+      sessionToken: mcpSession.token,
+    });
+    const workspaceDir = workspace.dir;
+
+    providerInstance = createCliChatProvider({
+      binary: cliBinary,
+      model,
+      apiKey: apiKey ?? undefined,
+      mcpToolContext: useNativeMcp,
+      toolBridge: useNativeMcp
+        ? undefined
+        : {
+            tools,
+            toolDefinitions: toolDefs,
+            conversationId: cacheKey,
+            userId,
+          },
+      cwd: workspaceDir,
+      correlationId,
+    });
+    log.info(
+      `Created CLI chat provider: ${provider} (${cliBinary}) model=${model} correlationId=${correlationId}`
+    );
+  } else if (fallback) {
+    // Build FallbackProvider if a backup model is configured
     try {
       const fbApiKey = await getProviderApiKey(fallback.provider);
       if (fbApiKey) {
@@ -533,7 +628,7 @@ async function createChatAgentInstance(
         providerInstance = createFallbackProvider({
           primary: {
             provider: providerType as AIProvider,
-            apiKey,
+            apiKey: apiKey!,
             baseUrl,
             headers: providerConfig?.headers,
           },
@@ -561,7 +656,15 @@ async function createChatAgentInstance(
   }
 
   const agent = createAgent(config, { tools, provider: providerInstance });
-  chatAgentCache.set(cacheKey, agent);
+
+  // Store correlation ID for CLI agents (used by SSE stream to forward MCP events)
+  if (isCliProvider && correlationId) {
+    cliCorrelationIds.set(agent, correlationId);
+  }
+
+  if (!isCliProvider) {
+    chatAgentCache.set(cacheKey, agent);
+  }
 
   return agent;
 }

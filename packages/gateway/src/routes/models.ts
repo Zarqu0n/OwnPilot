@@ -18,6 +18,7 @@ import {
 } from '@ownpilot/core';
 import { modelConfigsRepo } from '../db/repositories/model-configs.js';
 import { localProvidersRepo } from '../db/repositories/index.js';
+import { detectCliChatProviders } from '../services/cli-chat-provider.js';
 import {
   getUserId,
   apiResponse,
@@ -121,6 +122,15 @@ app.get('/', async (c) => {
         recommended: false,
       });
     }
+  }
+
+  // Include CLI chat providers (Claude CLI, Codex CLI, Gemini CLI)
+  // CLI providers don't expose model selection — they use their own default model.
+  // We only register them as configured providers so they appear in the provider dropdown.
+  const cliChatProviders = detectCliChatProviders();
+  for (const cli of cliChatProviders) {
+    if (!cli.installed) continue;
+    configuredProviders.push(cli.id);
   }
 
   return apiResponse(c, {

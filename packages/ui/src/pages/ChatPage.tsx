@@ -312,18 +312,27 @@ export function ChatPage() {
     acc[m.provider]!.push(m);
     return acc;
   }, {});
+  // Ensure CLI providers appear in dropdown even without model entries
+  for (const pid of configuredProviders) {
+    if (pid.startsWith('cli-') && !modelsByProvider[pid]) {
+      modelsByProvider[pid] = [];
+    }
+  }
 
   // Update model when provider changes
   const handleProviderChange = (newProvider: string) => {
     setProvider(newProvider);
-    const providerModels = modelsByProvider[newProvider];
-    if (providerModels && providerModels.length > 0) {
-      const recommended = providerModels.find((m) => m.recommended);
-      setModel(recommended?.id ?? providerModels[0]!.id);
+    // CLI providers don't have model selection — set empty model
+    if (newProvider.startsWith('cli-')) {
+      setModel('default');
+    } else {
+      const providerModels = modelsByProvider[newProvider];
+      if (providerModels && providerModels.length > 0) {
+        const recommended = providerModels.find((m) => m.recommended);
+        setModel(recommended?.id ?? providerModels[0]!.id);
+      }
     }
     setShowProviderMenu(false);
-    // Keep agent context - just update the provider/model being used
-    // Agent's personality/tools remain, only the underlying LLM changes
   };
 
   const handleNewChat = async () => {
@@ -520,7 +529,10 @@ export function ChatPage() {
                     <span className="font-medium text-text-primary dark:text-dark-text-primary">
                       {currentProviderName}
                     </span>
-                    <span className="text-text-muted dark:text-dark-text-muted">/ {model}</span>
+                    {/* CLI providers don't have model selection — they use their own defaults */}
+                    {!provider.startsWith('cli-') && (
+                      <span className="text-text-muted dark:text-dark-text-muted">/ {model}</span>
+                    )}
                   </>
                 )}
                 <svg
@@ -569,7 +581,8 @@ export function ChatPage() {
                         >
                           {providerNames[providerId] ?? providerId}
                         </div>
-                        {provider === providerId && (
+                        {/* CLI providers don't need model selection — they handle models internally */}
+                        {provider === providerId && !providerId.startsWith('cli-') && (
                           <div className="px-2 pb-2">
                             {providerModels.map((m) => (
                               <button

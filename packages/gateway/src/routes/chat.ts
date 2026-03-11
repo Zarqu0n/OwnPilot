@@ -31,7 +31,9 @@ import {
   getDefaultModel,
   getWorkspaceContext,
   getSessionInfo,
+  getCliCorrelationId,
 } from './agents.js';
+import { onMcpToolEvents } from '../mcp/mcp-events.js';
 import { resolveForProcess } from '../services/model-routing.js';
 import { ChatRepository } from '../db/repositories/index.js';
 import { modelConfigsRepo } from '../db/repositories/model-configs.js';
@@ -64,8 +66,25 @@ import {
 } from './chat-prompt.js';
 import { ConversationService, runPostChatProcessing } from '../services/conversation-service.js';
 import { handleLegacySend } from './chat-legacy-send.js';
+import type { McpToolEvent } from '../mcp/mcp-events.js';
 
 const log = getLog('Chat');
+
+function toMcpTraceEvent(event: McpToolEvent): {
+  type: McpToolEvent['type'];
+  toolName: string;
+  arguments?: Record<string, unknown>;
+  result?: McpToolEvent['result'];
+  timestamp: string;
+} {
+  return {
+    type: event.type,
+    toolName: event.toolName,
+    arguments: event.arguments,
+    result: event.result,
+    timestamp: event.timestamp,
+  };
+}
 
 // =============================================================================
 // Backward compatibility re-export
@@ -181,6 +200,14 @@ chatRoutes.post('/', async (c) => {
     }
   }
 
+  // CLI providers always use their own default model — ignore any model from the UI.
+  // Set requestedModel to a sentinel so validation passes, but leave model empty
+  // so the CliChatProvider falls through to its own default (from config.toml / login).
+  if (provider.startsWith('cli-')) {
+    model = '';
+    requestedModel = 'cli-default';
+  }
+
   // Check for demo mode
   if (await isDemoMode()) {
     const demoResponse = generateDemoResponse(body.message, provider, model);
@@ -241,16 +268,30 @@ chatRoutes.post('/', async (c) => {
     }
   }
 
-  // Load conversation if specified
+  // Load conversation if specified.
+  // When a workspace is explicitly selected, conversation/session IDs can be stale after
+  // workspace switches or server restarts. In that case, continue without failing the request.
+  let hasConversationFallback = false;
   if (body.conversationId) {
     const loaded = agent.loadConversation(body.conversationId);
     if (!loaded) {
-      return notFoundError(c, 'Conversation', body.conversationId);
+      if (body.workspaceId) {
+        hasConversationFallback = true;
+        log.warn('Conversation not found in agent memory; continuing with workspace fallback', {
+          conversationId: body.conversationId,
+          workspaceId: body.workspaceId,
+        });
+      } else {
+        return notFoundError(c, 'Conversation', body.conversationId);
+      }
     }
   }
 
   // ── System prompt initialization ──────────────────────────────────────────
-  const conversationId = agent.getConversation().id;
+  const conversationId =
+    body.conversationId && (body.workspaceId || !hasConversationFallback)
+      ? body.conversationId
+      : agent.getConversation().id;
   const isPromptInitialized = promptInitializedConversations.has(conversationId);
   const chatUserId = getUserId(c);
 
@@ -339,12 +380,36 @@ chatRoutes.post('/', async (c) => {
     const streamBus = tryGetMessageBus();
     if (streamBus) {
       return streamSSE(c, async (stream) => {
-        const conversationId = agent.getConversation().id;
+        const conversationId =
+          body.conversationId && (body.workspaceId || !hasConversationFallback)
+            ? body.conversationId
+            : agent.getConversation().id;
         const streamAgentId = body.agentId ?? `chat-${provider}`;
         const streamUserId = getUserId(c);
 
         wireStreamApproval(agent, stream);
         log.info(`[ExecSecurity] SSE requestApproval callback wired on agent (MessageBus path)`);
+
+        // ── MCP tool event forwarding for CLI providers ──
+        let unsubMcp: (() => void) | undefined;
+        const cliCorrelationId = getCliCorrelationId(agent);
+        if (cliCorrelationId) {
+          unsubMcp = onMcpToolEvents(cliCorrelationId, (event) => {
+            stream.writeSSE({
+              data: JSON.stringify({
+                type: event.type,
+                tool: {
+                  id: `mcp-${event.toolName}-${Date.now()}`,
+                  name: event.toolName,
+                  ...(event.arguments && { arguments: event.arguments }),
+                },
+                ...(event.result && { result: event.result }),
+                timestamp: event.timestamp,
+              }),
+              event: 'progress',
+            });
+          });
+        }
 
         try {
           await processStreamingViaBus(streamBus, stream, {
@@ -359,6 +424,7 @@ chatRoutes.post('/', async (c) => {
             contextWindowOverride: userContextWindow,
           });
         } finally {
+          unsubMcp?.();
           agent.setRequestApproval(undefined);
           agent.setExecutionPermissions(undefined);
           agent.setMaxToolCalls(undefined);
@@ -368,7 +434,10 @@ chatRoutes.post('/', async (c) => {
 
     // ── Legacy Streaming Path (fallback) ──────────────────────────────────
     return streamSSE(c, async (stream) => {
-      const conversationId = agent.getConversation().id;
+      const conversationId =
+        body.conversationId && (body.workspaceId || !hasConversationFallback)
+          ? body.conversationId
+          : agent.getConversation().id;
       const streamAgentId = body.agentId ?? `chat-${provider}`;
       const streamUserId = getUserId(c);
 
@@ -385,6 +454,29 @@ chatRoutes.post('/', async (c) => {
       });
 
       wireStreamApproval(agent, stream);
+
+      // ── MCP tool event forwarding for CLI providers ──
+      // Subscribe to real-time tool call events from MCP server and forward as SSE progress events.
+      let unsubMcp: (() => void) | undefined;
+      const cliCorrelationId = getCliCorrelationId(agent);
+      if (cliCorrelationId) {
+        unsubMcp = onMcpToolEvents(cliCorrelationId, (event) => {
+          state.mcpToolEvents.push(toMcpTraceEvent(event));
+          stream.writeSSE({
+            data: JSON.stringify({
+              type: event.type,
+              tool: {
+                id: `mcp-${event.toolName}-${Date.now()}`,
+                name: event.toolName,
+                ...(event.arguments && { arguments: event.arguments }),
+              },
+              ...(event.result && { result: event.result }),
+              timestamp: event.timestamp,
+            }),
+            event: 'progress',
+          });
+        });
+      }
 
       // Expose direct tools to LLM if requested (from picker selection)
       if (body.directTools?.length) {
@@ -438,6 +530,8 @@ chatRoutes.post('/', async (c) => {
           });
         }
       } finally {
+        // Clean up MCP event subscription
+        unsubMcp?.();
         // Always clean up per-request overrides, even on error
         if (body.directTools?.length) {
           agent.clearAdditionalTools();
@@ -459,7 +553,15 @@ chatRoutes.post('/', async (c) => {
   const bus = tryGetMessageBus();
   if (bus) {
     let busResult;
+    const mcpToolEvents: Array<ReturnType<typeof toMcpTraceEvent>> = [];
+    let unsubMcp: (() => void) | undefined;
     try {
+      const cliCorrelationId = getCliCorrelationId(agent);
+      if (cliCorrelationId) {
+        unsubMcp = onMcpToolEvents(cliCorrelationId, (event) => {
+          mcpToolEvents.push(toMcpTraceEvent(event));
+        });
+      }
       busResult = await processNonStreamingViaBus(bus, {
         agent,
         chatMessage,
@@ -469,12 +571,13 @@ chatRoutes.post('/', async (c) => {
         userId,
         agentId,
         requestId,
-        conversationId: body.conversationId ?? agent.getConversation().id,
+        conversationId,
       });
     } catch (busError) {
       agent.setExecutionPermissions(undefined);
       agent.setRequestApproval(undefined);
       agent.setMaxToolCalls(undefined);
+      unsubMcp?.();
       return apiError(
         c,
         {
@@ -489,6 +592,7 @@ chatRoutes.post('/', async (c) => {
     agent.setExecutionPermissions(undefined);
     agent.setRequestApproval(undefined);
     agent.setMaxToolCalls(undefined);
+    unsubMcp?.();
 
     const processingTime = Math.round(performance.now() - startTime);
 
@@ -514,13 +618,23 @@ chatRoutes.post('/', async (c) => {
     const busTrace = {
       duration: processingTime,
       toolCalls: [],
+      mcpToolEvents,
       modelCalls: [{ provider, model, duration: processingTime }],
       autonomyChecks: [],
       dbOperations: { reads: 0, writes: 0 },
       memoryOps: { adds: 0, recalls: 0 },
       triggersFired: [],
       errors: busResult.warnings ?? [],
-      events: busResult.stages.map((s) => ({ type: 'stage', name: s })),
+      events: [
+        ...busResult.stages.map((s) => ({ type: 'stage', name: s })),
+        ...mcpToolEvents.map((event) => ({
+          type: event.type,
+          name: event.toolName,
+          arguments: event.arguments,
+          result: event.result,
+          timestamp: event.timestamp,
+        })),
+      ],
       routing: busResult.response.metadata.routing ?? undefined,
     };
 
@@ -558,7 +672,7 @@ chatRoutes.post('/', async (c) => {
       success: true,
       data: {
         id: busResult.response.id,
-        conversationId: conversation.id,
+        conversationId,
         message: busCleanContent,
         response: busCleanContent,
         model,
